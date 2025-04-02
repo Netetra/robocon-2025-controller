@@ -1,53 +1,48 @@
 #![no_std]
 #![no_main]
 
+use core::cell::RefCell;
+
+use alloc::boxed::Box;
+use critical_section::Mutex;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, signal::Signal};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::{
     clock::CpuClock,
-    gpio::{
-        interconnect::{PeripheralInput, PeripheralOutput},
-        Level, Output, OutputPin,
-    },
+    gpio::{Level, Output, OutputPin},
     peripheral::Peripheral,
-    peripherals::{Peripherals, TWAI0},
+    peripherals::Peripherals,
     prelude::*,
     rng::Rng,
     timer::timg::TimerGroup,
-    twai::{
-        filter::{Filter, SingleExtendedFilter},
-        BaudRate, Twai, TwaiConfiguration, TwaiMode,
-    },
+    uart::{self, Uart},
     Async,
 };
-use esp_wifi::esp_now::EspNow;
+use esp_wifi::esp_now::{EspNow, EspNowSender, BROADCAST_ADDRESS};
+use heapless::Vec;
+use robocon_rs::{
+    components::gamepad::Gamepad,
+    node::{command::Command, message::EspNowMessage},
+    sbtp::Sbtp,
+    util::sized_slice,
+};
 use static_cell::StaticCell;
 use {defmt_rtt as _, esp_backtrace as _};
 
 extern crate alloc;
 
-static LED_FLASH_TIME_MS: u64 = 20;
+const NODE_ID: u8 = 0xFE;
+const ESPNOW_INTERVAL_MS: u64 = 20;
+const LED_FLASH_TIME_MS: u64 = 20;
+
+static GAMEPAD: Mutex<RefCell<Option<Gamepad>>> = Mutex::new(RefCell::new(None));
 
 fn peripherals_init(cpu_clock: CpuClock) -> Peripherals {
     let mut config = esp_hal::Config::default();
     config.cpu_clock = cpu_clock;
     esp_hal::init(config)
-}
-
-fn twai_init<'a, RX: PeripheralInput, TX: PeripheralOutput>(
-    twai: TWAI0,
-    filter: impl Filter,
-    baud_rate: BaudRate,
-    mode: TwaiMode,
-    rx_pin: impl Peripheral<P = RX> + 'a,
-    tx_pin: impl Peripheral<P = TX> + 'a,
-) -> Twai<'a, Async> {
-    let mut config = TwaiConfiguration::new(twai, rx_pin, tx_pin, baud_rate, mode).into_async();
-    config.set_filter(filter);
-    let twai = config.start();
-    twai
 }
 
 fn led_init(
@@ -80,6 +75,43 @@ async fn led_flash(
     }
 }
 
+#[embassy_executor::task]
+async fn gamepad_recv(mut sbtp: Sbtp<Uart<'static, Async>>) {
+    loop {
+        if let Ok(payload) = sbtp.receive().await {
+            critical_section::with(|cs| {
+                let mut gamepad = GAMEPAD.borrow_ref_mut(cs);
+                let gamepad = gamepad.as_mut().unwrap();
+                gamepad.update(&(sized_slice::<9>(&payload).unwrap().into()));
+            });
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn gamepad_send(mut esp_now_tx: EspNowSender<'static>) {
+    loop {
+        let raw_gamepad_data = critical_section::with(|cs| {
+            let mut gamepad = GAMEPAD.borrow_ref_mut(cs);
+            let gamepad = gamepad.as_mut().unwrap();
+            let data = gamepad.into_array();
+            gamepad.reset();
+            data
+        });
+        let message = EspNowMessage::new(
+            NODE_ID,
+            0x00,
+            Command::NotifyGamepadState,
+            Vec::<u8, 247>::from_slice(&raw_gamepad_data).unwrap(),
+        );
+        let _ = esp_now_tx
+            .send_async(&BROADCAST_ADDRESS, &message.into_esp_now_data())
+            .await
+            .unwrap();
+        Timer::after(Duration::from_millis(ESPNOW_INTERVAL_MS)).await;
+    }
+}
+
 #[main]
 async fn main(spawner: Spawner) {
     let peripherals = peripherals_init(CpuClock::max());
@@ -94,34 +126,44 @@ async fn main(spawner: Spawner) {
     );
     info!("Embassy initialized.");
 
-    let wifi_ctrl = esp_wifi::init(
-        timg0.timer0,
-        Rng::new(peripherals.RNG),
-        peripherals.RADIO_CLK,
-    )
-    .unwrap();
-    let esp_now = EspNow::new(&wifi_ctrl, peripherals.WIFI).unwrap();
+    let wifi_ctrl = Box::new(
+        esp_wifi::init(
+            timg0.timer0,
+            Rng::new(peripherals.RNG),
+            peripherals.RADIO_CLK,
+        )
+        .unwrap(),
+    );
+    let esp_now = EspNow::new(Box::leak(wifi_ctrl), peripherals.WIFI).unwrap();
     info!(
         "ESP Now initialized. version: {}",
         esp_now.version().unwrap()
     );
+    let (_, esp_now_tx, _esp_now_rx) = esp_now.split();
 
-    let mut twai = twai_init(
-        peripherals.TWAI0,
-        SingleExtendedFilter::new(b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxx", b"x"),
-        BaudRate::B1000K,
-        TwaiMode::Normal,
-        peripherals.GPIO1,
-        peripherals.GPIO2,
-    );
-    info!("TWAI initialized.");
+    let uart_config = uart::Config::default().baudrate(115200);
+    let mut uart = Uart::new(peripherals.UART0, peripherals.GPIO44, peripherals.GPIO43)
+        .unwrap()
+        .into_async();
+    uart.apply_config(&uart_config).unwrap();
 
-    let led_ctrl = led_init(&spawner, peripherals.GPIO7);
+    let sbtp = Sbtp::new(uart);
+    info!("SBTP initialized.");
+
+    let _led_ctrl = led_init(&spawner, peripherals.GPIO7);
     info!("LED Indicator initialized.");
 
-    let _ = spawner;
+    critical_section::with(|cs| {
+        GAMEPAD.borrow_ref_mut(cs).replace(Gamepad::default());
+    });
+
+    spawner.spawn(gamepad_recv(sbtp)).unwrap();
+    info!("Gamepad data receive task spawn.");
+
+    spawner.spawn(gamepad_send(esp_now_tx)).unwrap();
+    info!("Gamepad data send task spawn.");
 
     loop {
-        Timer::after(Duration::from_millis(500)).await;
+        Timer::after(Duration::from_millis(1)).await;
     }
 }
