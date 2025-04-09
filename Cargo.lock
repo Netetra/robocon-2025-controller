@@ -3,6 +3,12 @@
 version = 3
 
 [[package]]
+name = "advanced-pid"
+version = "0.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1f362a7a18d309d27ab34dbea24aa0635c313162ebb6053f94939aa155d56c5b"
+
+[[package]]
 name = "anyhow"
 version = "1.0.97"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1457,11 +1463,13 @@ dependencies = [
 [[package]]
 name = "robocon-rs"
 version = "0.1.0"
-source = "git+https://github.com/netetra/robocon-rs.git#285f6ee2e01a479f4ba01fcdda0ec6ddb9972121"
+source = "git+https://github.com/netetra/robocon-rs.git#22ea87180313480af7d5ac856831673a270523d0"
 dependencies = [
+ "advanced-pid",
  "bit_field",
  "bitfield-struct",
  "embedded-can",
+ "embedded-hal 1.0.0",
  "embedded-io-async",
  "heapless",
  "micromath",
